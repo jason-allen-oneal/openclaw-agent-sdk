@@ -1,0 +1,54 @@
+{
+  "id": "agent-sdk",
+  "name": "Agent SDK Packaging",
+  "description": "Agent SDK Packaging plugin — package validation, integrity hashing, config compilation, policy enforcement, mutation detection, and CLI tooling for agent packages.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true,
+    "onCommands": ["agent-sdk", "agent"]
+  },
+  "contracts": {
+    "trustedToolPolicies": ["agent-sdk-policy"]
+  },
+  "commandAliases": [
+    {
+      "name": "agent-sdk",
+      "kind": "cli"
+    },
+    {
+      "name": "agent",
+      "kind": "cli"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 }
+      },
+      "registry": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": { "type": "string" },
+            "description": { "type": "string" }
+          }
+        }
+      },
+      "policy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "denyMutableInstructionFiles": { "type": "boolean" },
+          "allowMutableUserInstructionFiles": { "type": "boolean" }
+        }
+      },
+      "upgradedAt": { "type": "string" },
+      "previousVersion": { "type": "string" }
+    }
+  }
+}

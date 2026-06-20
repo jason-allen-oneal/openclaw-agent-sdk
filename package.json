@@ -1,0 +1,51 @@
+{
+  "name": "@jason-allen-oneal/openclaw-agent-sdk",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Agent SDK Packaging plugin for OpenClaw — package validation, integrity hashing, config compilation, policy enforcement, and CLI tooling for agent packages.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "openclaw.plugin.json"
+  ],
+  "bin": {
+    "openclaw-agent": "./dist/cli.mjs"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepack": "pnpm build"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.24-beta.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "commander": "^14.0.0",
+    "ipaddr.js": "^2.4.0",
+    "openclaw": "2026.6.8",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jason-allen-oneal/openclaw-agent-sdk.git"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "agent-sdk",
+    "packaging",
+    "security",
+    "policy"
+  ],
+  "author": "Jason Allen O'Neal",
+  "license": "MIT"
+}
