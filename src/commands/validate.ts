@@ -1,84 +1,305 @@
-// @ts-nocheck
-
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { Command } from "commander";
 import { hashFile } from "../hash.js";
 import { INSTRUCTION_FILES } from "../index.js";
-import type { AgentPackageManifest, IntegrityManifest, ValidationResult } from "../index.js";
+import type {
+  AgentPackageManifest,
+  FileCopyEntry,
+  FileMutableEntry,
+  IntegrityManifest,
+  ValidationError,
+  ValidationResult,
+  ValidationWarning,
+} from "../index.js";
+import {
+  isSameOrInsidePath,
+  normalizeManifestPath,
+  resolvePackageFile,
+  resolveWorkspacePath,
+  validateRelativePath,
+} from "../paths.js";
 
 const INSTRUCTION_FILE_SET = new Set<string>(INSTRUCTION_FILES);
+
+type ValidationIssue = ValidationError;
+
+function issue(path: string, message: string): ValidationIssue {
+  return { path, message };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function loadJSON<T>(path: string): T {
   return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
-function validateSchema(manifest: AgentPackageManifest): string[] {
-  const errors: { path: string; message: string }[] = [];
-  if (!manifest.name) errors.push("name is required");
-  if (!manifest.version) errors.push("version is required");
-  if (!manifest.description) errors.push("description is required");
-  if (!manifest.files) errors.push("files is required");
-  if (!Array.isArray(manifest.files.copy)) errors.push("files.copy must be an array");
-  if (!Array.isArray(manifest.files.mutable)) errors.push("files.mutable must be an array");
+function validateString(value: unknown, path: string, errors: ValidationIssue[]): void {
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push(issue(path, "must be a non-empty string"));
+  }
+}
 
-  // Validate policy fields
-  if (manifest.policy) {
-    const validScopes = ["package", "global"];
-    if (manifest.policy.scope && !validScopes.includes(manifest.policy.scope)) {
-      errors.push(`policy.scope must be one of: ${validScopes.join(", ")}`);
+function validateBoolean(value: unknown, path: string, errors: ValidationIssue[]): void {
+  if (typeof value !== "boolean") {
+    errors.push(issue(path, "must be a boolean"));
+  }
+}
+
+function validateStringArray(value: unknown, path: string, errors: ValidationIssue[]): void {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
+    errors.push(issue(path, "must be an array of non-empty strings"));
+  }
+}
+
+function validateEnum(value: unknown, path: string, allowed: readonly string[], errors: ValidationIssue[]): void {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    errors.push(issue(path, `must be one of: ${allowed.join(", ")}`));
+  }
+}
+
+function validateSchema(manifest: unknown): ValidationIssue[] {
+  const errors: ValidationIssue[] = [];
+  if (!isRecord(manifest)) {
+    return [issue("agent-package.json", "must be a JSON object")];
+  }
+
+  validateString(manifest.name, "name", errors);
+  validateString(manifest.version, "version", errors);
+  validateString(manifest.description, "description", errors);
+
+  if (!isRecord(manifest.files)) {
+    errors.push(issue("files", "is required and must be an object"));
+  } else {
+    if (!Array.isArray(manifest.files.copy)) {
+      errors.push(issue("files.copy", "must be an array"));
     }
-    const validUpgrades = ["preserve-custom", "reset", "prompt"];
-    if (manifest.policy.onUpgrade && !validUpgrades.includes(manifest.policy.onUpgrade)) {
-      errors.push(`policy.onUpgrade must be one of: ${validUpgrades.join(", ")}`);
+    if (!Array.isArray(manifest.files.mutable)) {
+      errors.push(issue("files.mutable", "must be an array"));
     }
   }
 
-  // Validate secrets
-  if (manifest.secrets) {
-    if (!Array.isArray(manifest.secrets.consumer)) {
-      errors.push("secrets.consumer must be an array");
-    }
-    if (typeof manifest.secrets.mapping !== "object" || manifest.secrets.mapping === null) {
-      errors.push("secrets.mapping must be an object");
-    }
-    // Every consumer must have a mapping
-    if (Array.isArray(manifest.secrets.consumer) && typeof manifest.secrets.mapping === "object") {
-      for (const c of manifest.secrets.consumer) {
-        if (!(c.name in manifest.secrets.mapping)) {
-          errors.push(`secrets.mapping missing for consumer: ${c.name}`);
-        }
-      }
-    }
-  }
-
-  // Validate tools
-  if (manifest.tools?.sandbox?.network) {
-    const validEgress = ["full", "restricted", "none"];
-    const egress = manifest.tools.sandbox.network.egress;
-    if (egress && !validEgress.includes(egress)) {
-      errors.push(`tools.sandbox.network.egress must be one of: ${validEgress.join(", ")}`);
-    }
-  }
-
-  // Validate schedules
-  if (manifest.schedules) {
-    for (const s of manifest.schedules) {
-      if (!s.name) errors.push("schedule.name is required");
-      if (!s.cron) errors.push(`schedule "${s.name || "(unnamed)"}": cron is required`);
-      if (!s.payload) errors.push(`schedule "${s.name || "(unnamed)"}": payload is required`);
-      if (s.payload && !["agentTurn", "systemEvent"].includes(s.payload.kind)) {
-        errors.push(
-          `schedule "${s.name || "(unnamed)"}": payload.kind must be "agentTurn" or "systemEvent"`,
-        );
-      }
-    }
-  }
+  validateSkills(manifest.skills, errors);
+  validateSecrets(manifest.secrets, errors);
+  validateTools(manifest.tools, errors);
+  validateChannels(manifest.channels, errors);
+  validateSchedules(manifest.schedules, errors);
+  validatePolicy(manifest.policy, errors);
 
   return errors;
 }
 
-function hasFileArrays(manifest: AgentPackageManifest): boolean {
+function validateSkills(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push(issue("skills", "must be an array"));
+    return;
+  }
+  for (const [index, skill] of value.entries()) {
+    const path = `skills.${index}`;
+    if (!isRecord(skill)) {
+      errors.push(issue(path, "must be an object"));
+      continue;
+    }
+    validateString(skill.path, `${path}.path`, errors);
+    if (skill.required !== undefined) validateBoolean(skill.required, `${path}.required`, errors);
+  }
+}
+
+function validateSecrets(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    errors.push(issue("secrets", "must be an object"));
+    return;
+  }
+
+  if (!Array.isArray(value.consumer)) {
+    errors.push(issue("secrets.consumer", "must be an array"));
+  } else {
+    for (const [index, consumer] of value.consumer.entries()) {
+      const path = `secrets.consumer.${index}`;
+      if (!isRecord(consumer)) {
+        errors.push(issue(path, "must be an object"));
+        continue;
+      }
+      validateString(consumer.name, `${path}.name`, errors);
+      validateBoolean(consumer.required, `${path}.required`, errors);
+      if (consumer.description !== undefined) validateString(consumer.description, `${path}.description`, errors);
+    }
+  }
+
+  if (!isRecord(value.mapping)) {
+    errors.push(issue("secrets.mapping", "must be an object"));
+  } else {
+    for (const [name, mapping] of Object.entries(value.mapping)) {
+      const path = `secrets.mapping.${name}`;
+      if (!isRecord(mapping)) {
+        errors.push(issue(path, "must be an object"));
+        continue;
+      }
+      if (mapping.source === "env") {
+        validateString(mapping.key, `${path}.key`, errors);
+      } else if (mapping.source === "gateway") {
+        validateString(mapping.ref, `${path}.ref`, errors);
+      } else if (mapping.source === "file") {
+        validateString(mapping.path, `${path}.path`, errors);
+        const pathError = validateRelativePath(mapping.path, `${path}.path`);
+        if (pathError) errors.push(issue(`${path}.path`, pathError));
+      } else {
+        errors.push(issue(`${path}.source`, "must be one of: env, gateway, file"));
+      }
+    }
+  }
+
+  if (Array.isArray(value.consumer) && isRecord(value.mapping)) {
+    for (const consumer of value.consumer) {
+      if (!isRecord(consumer) || typeof consumer.name !== "string") continue;
+      if (!(consumer.name in value.mapping)) {
+        errors.push(issue("secrets.mapping", `missing mapping for consumer: ${consumer.name}`));
+      }
+    }
+  }
+
+  if (value.audit !== undefined) {
+    if (!isRecord(value.audit)) {
+      errors.push(issue("secrets.audit", "must be an object"));
+    } else {
+      if (value.audit.logAccess !== undefined) validateBoolean(value.audit.logAccess, "secrets.audit.logAccess", errors);
+      if (value.audit.redactInTranscripts !== undefined) {
+        validateBoolean(value.audit.redactInTranscripts, "secrets.audit.redactInTranscripts", errors);
+      }
+    }
+  }
+}
+
+function validateTools(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    errors.push(issue("tools", "must be an object"));
+    return;
+  }
+  if (value.allow !== undefined) validateStringArray(value.allow, "tools.allow", errors);
+  if (value.deny !== undefined) validateStringArray(value.deny, "tools.deny", errors);
+
+  if (value.sandbox !== undefined) {
+    if (!isRecord(value.sandbox)) {
+      errors.push(issue("tools.sandbox", "must be an object"));
+      return;
+    }
+    if (value.sandbox.mode !== undefined) {
+      validateEnum(value.sandbox.mode, "tools.sandbox.mode", ["inherit", "require", "none"], errors);
+    }
+    if (value.sandbox.elevated !== undefined) validateBoolean(value.sandbox.elevated, "tools.sandbox.elevated", errors);
+
+    if (value.sandbox.network !== undefined) validateNetworkPolicy(value.sandbox.network, errors);
+    if (value.sandbox.filesystem !== undefined) validateFilesystemPolicy(value.sandbox.filesystem, errors);
+  }
+}
+
+function validateNetworkPolicy(value: unknown, errors: ValidationIssue[]): void {
+  if (!isRecord(value)) {
+    errors.push(issue("tools.sandbox.network", "must be an object"));
+    return;
+  }
+  if (value.egress !== undefined) {
+    validateEnum(value.egress, "tools.sandbox.network.egress", ["full", "restricted", "none"], errors);
+  }
+  if (value.allowedDomains !== undefined) validateStringArray(value.allowedDomains, "tools.sandbox.network.allowedDomains", errors);
+  if (value.deniedDomains !== undefined) validateStringArray(value.deniedDomains, "tools.sandbox.network.deniedDomains", errors);
+  if (value.dnsRebindingCheck !== undefined) validateBoolean(value.dnsRebindingCheck, "tools.sandbox.network.dnsRebindingCheck", errors);
+  if (value.denyPrivateRanges !== undefined) validateBoolean(value.denyPrivateRanges, "tools.sandbox.network.denyPrivateRanges", errors);
+}
+
+function validateFilesystemPolicy(value: unknown, errors: ValidationIssue[]): void {
+  if (!isRecord(value)) {
+    errors.push(issue("tools.sandbox.filesystem", "must be an object"));
+    return;
+  }
+  for (const key of ["readPaths", "writePaths", "denyPaths"] as const) {
+    if (value[key] !== undefined) validateStringArray(value[key], `tools.sandbox.filesystem.${key}`, errors);
+  }
+}
+
+function validateChannels(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!isRecord(value) || !Array.isArray(value.bindings)) {
+    errors.push(issue("channels.bindings", "must be an array"));
+    return;
+  }
+  for (const [index, binding] of value.bindings.entries()) {
+    const path = `channels.bindings.${index}`;
+    if (!isRecord(binding)) {
+      errors.push(issue(path, "must be an object"));
+      continue;
+    }
+    validateEnum(binding.channel, `${path}.channel`, ["discord", "telegram", "whatsapp", "signal"], errors);
+    if (binding.channel === "discord") {
+      validateString(binding.guildId, `${path}.guildId`, errors);
+      validateString(binding.channelId, `${path}.channelId`, errors);
+      if (binding.requireMention !== undefined) validateBoolean(binding.requireMention, `${path}.requireMention`, errors);
+    } else if (binding.channel === "telegram") {
+      validateString(binding.chatId, `${path}.chatId`, errors);
+    } else if (binding.channel === "whatsapp" || binding.channel === "signal") {
+      validateString(binding.phone, `${path}.phone`, errors);
+    }
+  }
+}
+
+function validateSchedules(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push(issue("schedules", "must be an array"));
+    return;
+  }
+  for (const [index, schedule] of value.entries()) {
+    const path = `schedules.${index}`;
+    if (!isRecord(schedule)) {
+      errors.push(issue(path, "must be an object"));
+      continue;
+    }
+    validateString(schedule.name, `${path}.name`, errors);
+    validateString(schedule.cron, `${path}.cron`, errors);
+    if (schedule.tz !== undefined) validateString(schedule.tz, `${path}.tz`, errors);
+    if (schedule.sessionTarget !== undefined) {
+      validateEnum(schedule.sessionTarget, `${path}.sessionTarget`, ["isolated", "current"], errors);
+    }
+    if (!isRecord(schedule.payload)) {
+      errors.push(issue(`${path}.payload`, "must be an object"));
+    } else if (schedule.payload.kind === "agentTurn") {
+      validateString(schedule.payload.message, `${path}.payload.message`, errors);
+    } else if (schedule.payload.kind === "systemEvent") {
+      validateString(schedule.payload.text, `${path}.payload.text`, errors);
+    } else {
+      errors.push(issue(`${path}.payload.kind`, "must be agentTurn or systemEvent"));
+    }
+  }
+}
+
+function validatePolicy(value: unknown, errors: ValidationIssue[]): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    errors.push(issue("policy", "must be an object"));
+    return;
+  }
+  if (value.scope !== undefined) validateEnum(value.scope, "policy.scope", ["package", "global"], errors);
+  if (value.denyMutableInstructionFiles !== undefined) validateBoolean(value.denyMutableInstructionFiles, "policy.denyMutableInstructionFiles", errors);
+  if (value.allowMutableUserInstructionFiles !== undefined) {
+    validateBoolean(value.allowMutableUserInstructionFiles, "policy.allowMutableUserInstructionFiles", errors);
+  }
+  if (value.onUpgrade !== undefined) {
+    validateEnum(value.onUpgrade, "policy.onUpgrade", ["preserve-custom", "reset", "prompt"], errors);
+  }
+  if (value.maxTokensPerTurn !== undefined && typeof value.maxTokensPerTurn !== "number") {
+    errors.push(issue("policy.maxTokensPerTurn", "must be a number"));
+  }
+  if (value.allowedModels !== undefined) validateStringArray(value.allowedModels, "policy.allowedModels", errors);
+}
+
+function hasFileArrays(manifest: Partial<AgentPackageManifest>): manifest is Partial<AgentPackageManifest> & {
+  files: { copy: FileCopyEntry[]; mutable: FileMutableEntry[] };
+} {
   return (
     typeof manifest.files === "object" &&
     manifest.files !== null &&
@@ -87,42 +308,33 @@ function hasFileArrays(manifest: AgentPackageManifest): boolean {
   );
 }
 
-function isInsideRoot(root: string, target: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-function validatePackageFile(packagePath: string, src: string): string | null {
-  if (!src || isAbsolute(src)) return "absolute source paths are not allowed";
-  const resolved = resolve(packagePath, src);
-  if (!isInsideRoot(packagePath, resolved)) return "source path escapes package root";
-  if (!existsSync(resolved)) return `source file missing: ${src}`;
-  if (!lstatSync(resolved).isFile()) return "source must be a regular file";
-  const real = realpathSync(resolved);
-  if (!isInsideRoot(packagePath, real)) return "source resolves outside package root";
-  return null;
-}
-
-function validateWorkspacePath(workspacePath: string, dest: string): string | null {
-  if (!dest || isAbsolute(dest)) return "absolute destination paths are not allowed";
-  const resolved = resolve(workspacePath, dest);
-  if (!isInsideRoot(workspacePath, resolved)) return "destination path escapes workspace root";
-  return null;
-}
-
-function validateFilePaths(manifest: AgentPackageManifest, packagePath: string): string[] {
-  const errors: { path: string; message: string }[] = [];
+function validateFilePaths(manifest: Partial<AgentPackageManifest>, packagePath: string): ValidationIssue[] {
+  const errors: ValidationIssue[] = [];
   if (!hasFileArrays(manifest)) return errors;
-  for (const entry of manifest.files.copy) {
-    const srcError = validatePackageFile(packagePath, entry.src);
-    if (srcError) errors.push(`files.copy src "${entry.src}": ${srcError}`);
-    const destError = validateWorkspacePath(packagePath, entry.dest);
-    if (destError) errors.push(`files.copy dest "${entry.dest}": ${destError}`);
+
+  for (const [index, entry] of manifest.files.copy.entries()) {
+    const path = `files.copy.${index}`;
+    if (!isRecord(entry)) {
+      errors.push(issue(path, "must be an object"));
+      continue;
+    }
+    const src = resolvePackageFile(packagePath, entry.src, `${path}.src`);
+    if (src.error) errors.push(issue(`${path}.src`, src.error));
+    const dest = resolveWorkspacePath(packagePath, entry.dest, `${path}.dest`);
+    if (dest.error) errors.push(issue(`${path}.dest`, dest.error));
   }
-  for (const entry of manifest.files.mutable) {
-    const destError = validateWorkspacePath(packagePath, entry.dest);
-    if (destError) errors.push(`files.mutable "${entry.dest}": ${destError}`);
+
+  for (const [index, entry] of manifest.files.mutable.entries()) {
+    const path = `files.mutable.${index}`;
+    if (!isRecord(entry)) {
+      errors.push(issue(path, "must be an object"));
+      continue;
+    }
+    const dest = resolveWorkspacePath(packagePath, entry.dest, `${path}.dest`);
+    if (dest.error) errors.push(issue(`${path}.dest`, dest.error));
+    if (entry.description !== undefined) validateString(entry.description, `${path}.description`, errors);
   }
+
   return errors;
 }
 
@@ -130,84 +342,75 @@ function validateIntegrity(
   manifest: AgentPackageManifest,
   integrity: IntegrityManifest,
   packagePath: string,
-): string[] {
-  const errors: { path: string; message: string }[] = [];
+): ValidationIssue[] {
+  const errors: ValidationIssue[] = [];
   if (!hasFileArrays(manifest)) return errors;
 
-  // Check package identity matches
   if (integrity.package.name !== manifest.name) {
-    errors.push(
-      `integrity manifest package name mismatch: "${integrity.package.name}" vs "${manifest.name}"`,
-    );
+    errors.push(issue("openclaw.integrity.json", `package name mismatch: ${integrity.package.name} vs ${manifest.name}`));
   }
   if (integrity.package.version !== manifest.version) {
-    errors.push(
-      `integrity manifest version mismatch: "${integrity.package.version}" vs "${manifest.version}"`,
-    );
+    errors.push(issue("openclaw.integrity.json", `version mismatch: ${integrity.package.version} vs ${manifest.version}`));
+  }
+  if (integrity.algorithm !== "sha256") {
+    errors.push(issue("openclaw.integrity.json", "algorithm must be sha256"));
   }
 
-  // Re-hash every tracked file and compare
-  for (const [dest, expectedHash] of Object.entries(integrity.files)) {
-    // Find the copy entry for this dest
-    const copyEntry = manifest.files.copy.find((e) => e.dest === dest);
+  for (const [dest, expectedHash] of Object.entries(integrity.files ?? {})) {
+    const copyEntry = manifest.files.copy.find((entry) => entry.dest === dest);
     if (!copyEntry) {
-      errors.push(`integrity tracks "${dest}" but no files.copy entry exists`);
+      errors.push(issue("openclaw.integrity.json", `tracks ${dest} but no files.copy entry exists`));
       continue;
     }
     const filePath = resolve(packagePath, copyEntry.src);
     if (!existsSync(filePath)) {
-      errors.push(`integrity tracks "${dest}" but source file missing: ${copyEntry.src}`);
+      errors.push(issue("openclaw.integrity.json", `tracks ${dest} but source file is missing: ${copyEntry.src}`));
       continue;
     }
     const actualHash = hashFile(filePath);
     if (actualHash !== expectedHash) {
-      errors.push(`integrity mismatch for "${dest}": file has changed since pack`);
+      errors.push(issue("openclaw.integrity.json", `integrity mismatch for ${dest}: file has changed since pack`));
     }
   }
 
-  // Check for copy entries not in integrity
   for (const entry of manifest.files.copy) {
-    if (!(entry.dest in integrity.files)) {
-      errors.push(`files.copy entry "${entry.dest}" not tracked in integrity manifest`);
+    if (!(entry.dest in (integrity.files ?? {}))) {
+      errors.push(issue("openclaw.integrity.json", `files.copy entry not tracked: ${entry.dest}`));
     }
   }
 
   return errors;
 }
 
-function validateMutableInstructionPolicy(manifest: AgentPackageManifest): string[] {
-  const errors: { path: string; message: string }[] = [];
+function validateMutableInstructionPolicy(manifest: Partial<AgentPackageManifest>): ValidationIssue[] {
+  const errors: ValidationIssue[] = [];
   if (!hasFileArrays(manifest)) return errors;
-  const denyMutable = manifest.policy?.denyMutableInstructionFiles !== false; // default true
-
+  const denyMutable = manifest.policy?.denyMutableInstructionFiles !== false;
   if (!denyMutable) return errors;
 
   const allowUser = manifest.policy?.allowMutableUserInstructionFiles === true;
 
   for (const mutableEntry of manifest.files.mutable) {
-    const dest = mutableEntry.dest;
-
-    // Check if any instruction file would fall under this mutable path
+    const mutableDest = normalizeManifestPath(mutableEntry.dest);
     for (const instrFile of INSTRUCTION_FILE_SET) {
       if (instrFile === "USER.md" && allowUser) continue;
-
-      // Exact match or parent directory match
-      if (
-        dest === instrFile ||
-        dest.endsWith(`/${instrFile}`) ||
-        instrFile.startsWith(`${dest}/`)
-      ) {
+      if (isSameOrInsidePath(mutableDest, instrFile) || isSameOrInsidePath(instrFile, mutableDest)) {
         errors.push(
-          `mutable path "${dest}" contains instruction file "${instrFile}" but denyMutableInstructionFiles is true`,
+          issue(
+            "agent-package.json",
+            `mutable path ${mutableEntry.dest} contains instruction file ${instrFile} but denyMutableInstructionFiles is true`,
+          ),
         );
       }
     }
 
-    // Check if any copied file's dest falls under a mutable path
     for (const copyEntry of manifest.files.copy) {
-      if (copyEntry.dest === dest || copyEntry.dest.startsWith(`${dest}/`)) {
+      if (isSameOrInsidePath(mutableDest, copyEntry.dest)) {
         errors.push(
-          `mutable path "${dest}" overlaps with copied file "${copyEntry.dest}" — copied files are immutable`,
+          issue(
+            "agent-package.json",
+            `mutable path ${mutableEntry.dest} overlaps copied immutable file ${copyEntry.dest}`,
+          ),
         );
       }
     }
@@ -221,82 +424,63 @@ export function runValidation(packagePath: string): {
   integrity: IntegrityManifest | null;
 } {
   const resolved = resolve(packagePath);
-  const errors: { path: string; message: string }[] = [];
-  const warnings: string[] = [];
+  const errors: ValidationIssue[] = [];
+  const warnings: ValidationWarning[] = [];
 
-  // Load manifest
   const manifestPath = resolve(resolved, "agent-package.json");
   if (!existsSync(manifestPath)) {
     return {
       result: {
         valid: false,
-        errors: [{ path: "agent-package.json", message: "not found" }],
+        errors: [issue("agent-package.json", "not found")],
         warnings: [],
       },
       integrity: null,
     };
   }
 
-  let manifest: AgentPackageManifest;
+  let rawManifest: unknown;
   try {
-    manifest = loadJSON<AgentPackageManifest>(manifestPath);
+    rawManifest = loadJSON<unknown>(manifestPath);
   } catch (e) {
     return {
       result: {
         valid: false,
-        errors: [{ path: "agent-package.json", message: `parse error: ${(e as Error).message}` }],
+        errors: [issue("agent-package.json", `parse error: ${(e as Error).message}`)],
         warnings: [],
       },
       integrity: null,
     };
   }
 
-  // Schema validation
-  errors.push(...validateSchema(manifest).map((m) => ({ path: "agent-package.json", message: m })) as { path: string; message: string }[]);
-  errors.push(
-    ...validateFilePaths(manifest, resolved).map((m) => ({
-      path: "agent-package.json",
-      message: m,
-    })) as { path: string; message: string }[],
-  );
+  errors.push(...validateSchema(rawManifest));
 
-  // Integrity check
+  const manifest = rawManifest as Partial<AgentPackageManifest>;
+  errors.push(...validateFilePaths(manifest, resolved));
+  errors.push(...validateMutableInstructionPolicy(manifest));
+
   let integrity: IntegrityManifest | null = null;
   const integrityPath = resolve(resolved, "openclaw.integrity.json");
   if (existsSync(integrityPath)) {
     try {
       integrity = loadJSON<IntegrityManifest>(integrityPath);
-      errors.push(
-        ...validateIntegrity(manifest, integrity, resolved).map((m) => ({
-          path: "openclaw.integrity.json",
-          message: m,
-        })),
-      );
+      if (hasFileArrays(manifest)) {
+        errors.push(...validateIntegrity(manifest as AgentPackageManifest, integrity, resolved));
+      }
     } catch (e) {
-      errors.push({
-        path: "openclaw.integrity.json",
-        message: `parse error: ${(e as Error).message}`,
-      });
+      errors.push(issue("openclaw.integrity.json", `parse error: ${(e as Error).message}`));
     }
   } else {
     warnings.push({
       path: "openclaw.integrity.json",
-      message: "not found — run 'pack' to generate",
+      message: "not found; run 'pack' to generate",
     });
   }
-
-  // Mutable instruction file policy
-  errors.push(
-    ...validateMutableInstructionPolicy(manifest).map((m) => ({
-      path: "agent-package.json",
-      message: m,
-    })),
-  );
 
   return {
     result: {
       valid: errors.length === 0,
-      errors: errors as { path: string; message: string }[],
+      errors,
       warnings,
     },
     integrity,
@@ -304,21 +488,19 @@ export function runValidation(packagePath: string): {
 }
 
 export const validateCommand = new Command("validate")
-  .description("Validate manifest schema + integrity + mutable instruction policy")
+  .description("Validate manifest schema, integrity, paths, secrets, schedules, and mutable instruction policy")
   .argument("[path]", "Package directory", ".")
   .action(async (packagePath: string) => {
     const { result } = runValidation(packagePath);
 
-    if (result.warnings.length > 0) {
-      for (const w of result.warnings) {
-        console.warn(`  Warning: ${w.path}: ${w.message}`);
-      }
+    for (const warning of result.warnings) {
+      console.warn(`  Warning: ${warning.path}: ${warning.message}`);
     }
 
     if (result.errors.length > 0) {
       console.error("Validation failed:");
-      for (const e of result.errors) {
-        console.error(`  - ${e.path}: ${e.message}`);
+      for (const error of result.errors) {
+        console.error(`  - ${error.path}: ${error.message}`);
       }
       process.exit(1);
     }
