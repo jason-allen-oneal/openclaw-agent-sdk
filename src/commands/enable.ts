@@ -1,4 +1,4 @@
-// @openclaw/agent-sdk — Enable command: validate → compile → copy files → write config.
+// @openclaw/agent-sdk — Enable command: validate, compile, copy files, and write package state.
 
 import {
   copyFileSync,
@@ -12,7 +12,8 @@ import {
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Command } from "commander";
 import { compileManifest } from "../compiler/compiler.js";
-import type { AgentPackageManifest, IntegrityManifest } from "../index.js";
+import { applyConfigDiff } from "../compiler/live.js";
+import type { AgentPackageManifest } from "../index.js";
 import { runValidation } from "./validate.js";
 
 function loadManifest(packagePath: string): AgentPackageManifest {
@@ -84,48 +85,48 @@ function ensureMutableDirs(manifest: AgentPackageManifest, workspacePath: string
   }
 }
 
-function writeConfigDiff(changes: Record<string, unknown>, workspacePath: string): void {
-  writeFileSync(
-    resolve(workspacePath, "agent-sdk-config.json"),
-    JSON.stringify(changes, null, 2) + "\n",
-    "utf8",
-  );
+function readJsonObject(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeJson(path: string, value: unknown): void {
+  writeFileSync(path, JSON.stringify(value, null, 2) + "\n", "utf8");
 }
 
 function registerPackage(manifest: AgentPackageManifest, workspacePath: string): void {
   const registryPath = resolve(workspacePath, "agent-sdk-registry.json");
-  let registry: Record<string, unknown> = {};
-  if (existsSync(registryPath)) {
-    try {
-      registry = JSON.parse(readFileSync(registryPath, "utf8"));
-    } catch {
-      registry = {};
-    }
-  }
+  const registry = readJsonObject(registryPath);
   registry[manifest.name] = {
     version: manifest.version,
     description: manifest.description,
     enabledAt: new Date().toISOString(),
   };
-  writeFileSync(registryPath, JSON.stringify(registry, null, 2) + "\n", "utf8");
+  writeJson(registryPath, registry);
+}
+
+function writePackageEntry(filename: string, packageName: string, value: unknown, workspacePath: string): void {
+  const filePath = resolve(workspacePath, filename);
+  const data = readJsonObject(filePath);
+  data[packageName] = value;
+  writeJson(filePath, data);
 }
 
 function writeChannelBindings(manifest: AgentPackageManifest, workspacePath: string): void {
   if (!manifest.channels?.bindings.length) return;
-  writeFileSync(
-    resolve(workspacePath, "agent-sdk-bindings.json"),
-    JSON.stringify(manifest.channels.bindings, null, 2) + "\n",
-    "utf8",
-  );
+  writePackageEntry("agent-sdk-bindings.json", manifest.name, manifest.channels.bindings, workspacePath);
 }
 
 function writeSchedules(manifest: AgentPackageManifest, workspacePath: string): void {
   if (!manifest.schedules?.length) return;
-  writeFileSync(
-    resolve(workspacePath, "agent-sdk-schedules.json"),
-    JSON.stringify(manifest.schedules, null, 2) + "\n",
-    "utf8",
-  );
+  writePackageEntry("agent-sdk-schedules.json", manifest.name, manifest.schedules, workspacePath);
 }
 
 export const enableCommand = new Command("enable")
@@ -156,19 +157,14 @@ export const enableCommand = new Command("enable")
     }
 
     const diff = compileManifest(manifest, { strict: false });
-    for (const u of diff.unsupported) {
-      console.warn(`  Warning: unsupported field: ${u}`);
-    }
-    for (const w of diff.warnings) {
-      console.warn(`  Warning: ${w}`);
-    }
+    for (const u of diff.unsupported) console.warn(`  Warning: unsupported field: ${u}`);
+    for (const w of diff.warnings) console.warn(`  Warning: ${w}`);
 
     console.log(`\nPackage: ${manifest.name}@${manifest.version}`);
     console.log(`Files to copy: ${manifest.files.copy.length}`);
     console.log(`Mutable dirs: ${manifest.files.mutable.length}`);
     console.log(`Config changes: ${Object.keys(diff.changes).length}`);
-    if (manifest.channels?.bindings.length)
-      console.log(`Channel bindings: ${manifest.channels.bindings.length}`);
+    if (manifest.channels?.bindings.length) console.log(`Channel bindings: ${manifest.channels.bindings.length}`);
     if (manifest.schedules?.length) console.log(`Schedules: ${manifest.schedules.length}`);
 
     if (options.dryRun) {
@@ -178,11 +174,17 @@ export const enableCommand = new Command("enable")
       return;
     }
 
+    const configResult = applyConfigDiff(diff, workspacePath);
+    if (!configResult.success) {
+      console.error("Config write failed:");
+      for (const e of configResult.errors) console.error(`  - ${e}`);
+      process.exit(1);
+    }
+
     const written = copyFilesToWorkspace(manifest, resolved, workspacePath);
     console.log(`\nCopied ${written.length} files to workspace.`);
     ensureMutableDirs(manifest, workspacePath);
-    writeConfigDiff(diff.changes, workspacePath);
-    console.log("Config diff written to agent-sdk-config.json");
+    console.log("Config diff merged into agent-sdk-config.json");
     registerPackage(manifest, workspacePath);
     console.log("Package registered in agent-sdk-registry.json");
     writeChannelBindings(manifest, workspacePath);
