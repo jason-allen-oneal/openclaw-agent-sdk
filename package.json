@@ -5,16 +5,29 @@
   "description": "Agent SDK Packaging plugin for OpenClaw — package validation, integrity hashing, config compilation, policy enforcement, and CLI tooling for agent packages.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    }
+  },
   "files": [
     "dist",
+    "README.md",
     "openclaw.plugin.json"
   ],
   "bin": {
-    "openclaw-agent": "./dist/cli.mjs"
+    "openclaw-agent": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "ci": "pnpm typecheck && pnpm build && pnpm test && pnpm pack",
     "prepack": "pnpm build"
   },
   "peerDependencies": {
@@ -25,7 +38,8 @@
     "commander": "^14.0.0",
     "ipaddr.js": "^2.4.0",
     "openclaw": "2026.6.8",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=22"
