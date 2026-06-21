@@ -1,8 +1,9 @@
 // @openclaw/agent-sdk — Live config integration: apply compiled diff to workspace config.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "path";
+import { resolve } from "node:path";
 import type { AgentPackageManifest, ConfigDiff } from "../index.js";
+import { isDangerousPathSegment } from "../paths.js";
 import { compileManifest } from "./compiler.js";
 
 export interface LiveConfigResult {
@@ -12,15 +13,31 @@ export interface LiveConfigResult {
   errors: string[];
 }
 
+function readConfig(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Set a nested value in an object using a dot-path key.
  */
 function setNested(obj: Record<string, unknown>, dotPath: string, value: unknown): void {
   const parts = dotPath.split(".");
+  if (parts.length === 0 || parts.some((part) => part === "" || isDangerousPathSegment(part))) {
+    throw new Error(`unsafe config path: ${dotPath}`);
+  }
+
   let current: Record<string, unknown> = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i];
-    if (!(part in current) || typeof current[part] !== "object" || current[part] === null) {
+    if (!(part in current) || typeof current[part] !== "object" || current[part] === null || Array.isArray(current[part])) {
       current[part] = {};
     }
     current = current[part] as Record<string, unknown>;
@@ -37,6 +54,7 @@ function deepMerge(
 ): Record<string, unknown> {
   const result = JSON.parse(JSON.stringify(target)) as Record<string, unknown>;
   for (const [key, value] of Object.entries(source)) {
+    if (isDangerousPathSegment(key)) continue;
     if (
       value !== null &&
       typeof value === "object" &&
@@ -58,7 +76,6 @@ function deepMerge(
 
 /**
  * Apply a config diff to the workspace's agent-sdk-config.json.
- * Unflattens dot-path keys into nested objects, then deep-merges with existing config.
  */
 export function applyConfigDiff(diff: ConfigDiff, workspacePath: string): LiveConfigResult {
   const applied: string[] = [];
@@ -66,34 +83,20 @@ export function applyConfigDiff(diff: ConfigDiff, workspacePath: string): LiveCo
   const configPath = resolve(workspacePath, "agent-sdk-config.json");
 
   try {
-    // Load existing config or start fresh
-    let existing: Record<string, unknown> = {};
-    if (existsSync(configPath)) {
-      try {
-        existing = JSON.parse(readFileSync(configPath, "utf8"));
-      } catch {
-        existing = {};
-      }
-    }
+    const existing = readConfig(configPath);
 
-    // Unflatten dot-path keys into a nested object
     const unflattened: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(diff.changes)) {
       setNested(unflattened, key, value);
     }
 
-    // Deep merge
     const merged = deepMerge(existing, unflattened);
 
-    // Special handling: agentPackages.enabled should accumulate, not overwrite
-    if (
-      Array.isArray(((unflattened as Record<string, unknown>).agentPackages as Record<string, unknown>)?.enabled) &&
-      Array.isArray(((existing as Record<string, unknown>).agentPackages as Record<string, unknown>)?.enabled)
-    ) {
-      const existingEnabled = (existing as Record<string, Record<string, unknown>>).agentPackages?.enabled as string[] | undefined;
-      const newEnabled = (unflattened as Record<string, Record<string, unknown>>).agentPackages?.enabled as string[] | undefined;
-      const combined = Array.from(new Set<string>([...existingEnabled ?? [], ...newEnabled ?? []]));
-      if (!merged.agentPackages) merged.agentPackages = {};
+    const existingPackages = existing.agentPackages as Record<string, unknown> | undefined;
+    const newPackages = unflattened.agentPackages as Record<string, unknown> | undefined;
+    if (Array.isArray(existingPackages?.enabled) && Array.isArray(newPackages?.enabled)) {
+      const combined = Array.from(new Set<string>([...existingPackages.enabled, ...newPackages.enabled]));
+      if (!merged.agentPackages || typeof merged.agentPackages !== "object") merged.agentPackages = {};
       (merged.agentPackages as Record<string, unknown>).enabled = combined;
     }
 
@@ -131,16 +134,8 @@ export function enableWithLiveConfig(
   workspacePath: string,
 ): LiveConfigResult {
   const diff = compileManifest(manifest, { strict: false });
-
   const configPath = resolve(workspacePath, "agent-sdk-config.json");
-  let backup: Record<string, unknown> = {};
-  if (existsSync(configPath)) {
-    try {
-      backup = JSON.parse(readFileSync(configPath, "utf8"));
-    } catch {
-      backup = {};
-    }
-  }
+  const backup = readConfig(configPath);
 
   const result = applyConfigDiff(diff, workspacePath);
 
