@@ -1,4 +1,4 @@
-// @openclaw/agent-sdk — Config compiler: manifest → OpenClaw config diff (dry-run, no writes).
+// @openclaw/agent-sdk — Config compiler: manifest to OpenClaw config diff (dry-run, no writes).
 
 import type {
   AgentPackageManifest,
@@ -6,40 +6,32 @@ import type {
   ToolsDeclaration,
   ChannelsDeclaration,
   ScheduleDeclaration,
-  PolicyDeclaration,
   SecretsDeclaration,
 } from "../index.js";
 
 export interface ConfigDiff {
-  /** Dot-path → new value for each changed field. */
+  /** Dot-path to new value for each changed field. */
   changes: Record<string, unknown>;
   /** Dot-paths that would be removed. */
   removals: string[];
-  /** Fields in the manifest that don't map to any known config path. */
+  /** Fields in the manifest that do not map to any known config path. */
   unsupported: string[];
   /** Warnings (non-fatal). */
   warnings: string[];
 }
 
 export interface CompilerOptions {
-  /** If true, reject any unsupported fields. Default: true. */
+  /** If true, reject unsupported fields. Default: true. */
   strict?: boolean;
 }
 
-/**
- * Known config paths that manifest fields map to.
- * These are the actual dot-paths in openclaw.json.
- */
-const KNOWN_PATHS = new Set([
-  // Agent defaults
-  "agents.defaults.model",
-  "agents.defaults.contextWindow",
+const KNOWN_STATIC_PATHS = new Set([
   "agents.defaults.maxTokensPerTurn",
   "agents.defaults.allowedModels",
-  // Tools
   "agents.defaults.tools.allow",
   "agents.defaults.tools.deny",
-  // Sandbox / network
+  "agents.defaults.sandbox.mode",
+  "agents.defaults.sandbox.elevated",
   "agents.defaults.sandbox.network.egress",
   "agents.defaults.sandbox.network.allowedDomains",
   "agents.defaults.sandbox.network.deniedDomains",
@@ -48,23 +40,31 @@ const KNOWN_PATHS = new Set([
   "agents.defaults.sandbox.filesystem.readPaths",
   "agents.defaults.sandbox.filesystem.writePaths",
   "agents.defaults.sandbox.filesystem.denyPaths",
-  // Secrets
   "secrets.mapping",
   "secrets.audit.logAccess",
   "secrets.audit.redactInTranscripts",
-  // Channels / bindings
   "bindings",
-  // Schedules
   "cron.jobs",
-  // Agent packages
   "agentPackages.enabled",
   "agentPackages.policy.denyMutableInstructionFiles",
   "agentPackages.policy.allowMutableUserInstructionFiles",
-  "agentPackages.packages",
+  "agentPackages.policy.onUpgrade",
   "agentPackages.registry",
   "agentPackages.upgradedAt",
   "agentPackages.previousVersion",
 ]);
+
+function isKnownConfigPath(path: string): boolean {
+  return KNOWN_STATIC_PATHS.has(path) || path.startsWith("agentPackages.packages.");
+}
+
+function assertKnownOutputPaths(diff: ConfigDiff): void {
+  for (const path of Object.keys(diff.changes)) {
+    if (!isKnownConfigPath(path) && !diff.unsupported.includes(path)) {
+      diff.unsupported.push(path);
+    }
+  }
+}
 
 /**
  * Compile an agent-package manifest into a config diff.
@@ -89,7 +89,6 @@ export function compileManifest(
   const scopedSandboxBase =
     policyScope === "global" ? "agents.defaults.sandbox" : `${packageBase}.sandbox`;
 
-  // ── Policy ─────────────────────────────────────────────────────────
   if (manifest.policy) {
     const p = manifest.policy;
     if (p.maxTokensPerTurn !== undefined) {
@@ -99,47 +98,36 @@ export function compileManifest(
       changes[scopedPolicyPath("allowedModels")] = p.allowedModels;
     }
     if (p.denyMutableInstructionFiles !== undefined) {
-      changes[scopedMutablePolicyPath("denyMutableInstructionFiles")] =
-        p.denyMutableInstructionFiles;
+      changes[scopedMutablePolicyPath("denyMutableInstructionFiles")] = p.denyMutableInstructionFiles;
     }
     if (p.allowMutableUserInstructionFiles !== undefined) {
-      changes[scopedMutablePolicyPath("allowMutableUserInstructionFiles")] =
-        p.allowMutableUserInstructionFiles;
+      changes[scopedMutablePolicyPath("allowMutableUserInstructionFiles")] = p.allowMutableUserInstructionFiles;
+    }
+    if (p.onUpgrade !== undefined) {
+      changes[scopedMutablePolicyPath("onUpgrade")] = p.onUpgrade;
     }
     if (p.scope !== undefined && p.scope !== "package" && p.scope !== "global") {
       if (strict) unsupported.push("policy.scope");
       else warnings.push("policy.scope: must be package or global");
     }
-    if (p.onUpgrade !== undefined) {
-      if (strict) {
-        unsupported.push("policy.onUpgrade");
-      } else {
-        warnings.push("policy.onUpgrade: not yet supported in config compiler");
-      }
-    }
   }
 
-  // ── Tools ──────────────────────────────────────────────────────────
   if (manifest.tools) {
-    compileTools(manifest.tools, scopedToolsBase, scopedSandboxBase, changes, unsupported, warnings, strict);
+    compileTools(manifest.tools, scopedToolsBase, scopedSandboxBase, changes);
   }
 
-  // ── Secrets ────────────────────────────────────────────────────────
   if (manifest.secrets) {
-    compileSecrets(manifest.secrets, changes, unsupported, warnings, strict);
+    compileSecrets(manifest.secrets, changes, warnings);
   }
 
-  // ── Channels ───────────────────────────────────────────────────────
   if (manifest.channels) {
     compileChannels(manifest.channels, changes, unsupported, warnings, strict);
   }
 
-  // ── Schedules ──────────────────────────────────────────────────────
   if (manifest.schedules) {
-    compileSchedules(manifest.schedules, changes, unsupported, warnings, strict);
+    compileSchedules(manifest.schedules, changes);
   }
 
-  // ── Agent Packages registry ────────────────────────────────────────
   changes["agentPackages.enabled"] = [manifest.name];
   changes["agentPackages.registry"] = {
     [manifest.name]: {
@@ -148,7 +136,9 @@ export function compileManifest(
     },
   };
 
-  return { changes, removals, unsupported, warnings };
+  const diff = { changes, removals, unsupported, warnings };
+  assertKnownOutputPaths(diff);
+  return diff;
 }
 
 function compileTools(
@@ -156,9 +146,6 @@ function compileTools(
   toolsBase: string,
   sandboxBase: string,
   changes: Record<string, unknown>,
-  unsupported: string[],
-  warnings: string[],
-  strict: boolean,
 ): void {
   if (tools.allow !== undefined) {
     changes[`${toolsBase}.allow`] = tools.allow;
@@ -168,25 +155,14 @@ function compileTools(
   }
   if (tools.sandbox) {
     const s = tools.sandbox;
-    if (s.mode !== undefined) {
-      if (strict) unsupported.push("tools.sandbox.mode");
-      else warnings.push("tools.sandbox.mode: not yet supported");
-    }
-    if (s.elevated !== undefined) {
-      if (strict) unsupported.push("tools.sandbox.elevated");
-      else warnings.push("tools.sandbox.elevated: not yet supported");
-    }
-    if (s.network) {
-      compileNetworkPolicy(s.network, `${sandboxBase}.network`, changes);
-    }
+    if (s.mode !== undefined) changes[`${sandboxBase}.mode`] = s.mode;
+    if (s.elevated !== undefined) changes[`${sandboxBase}.elevated`] = s.elevated;
+    if (s.network) compileNetworkPolicy(s.network, `${sandboxBase}.network`, changes);
     if (s.filesystem) {
       const fs = s.filesystem;
-      if (fs.readPaths !== undefined)
-        changes[`${sandboxBase}.filesystem.readPaths`] = fs.readPaths;
-      if (fs.writePaths !== undefined)
-        changes[`${sandboxBase}.filesystem.writePaths`] = fs.writePaths;
-      if (fs.denyPaths !== undefined)
-        changes[`${sandboxBase}.filesystem.denyPaths`] = fs.denyPaths;
+      if (fs.readPaths !== undefined) changes[`${sandboxBase}.filesystem.readPaths`] = fs.readPaths;
+      if (fs.writePaths !== undefined) changes[`${sandboxBase}.filesystem.writePaths`] = fs.writePaths;
+      if (fs.denyPaths !== undefined) changes[`${sandboxBase}.filesystem.denyPaths`] = fs.denyPaths;
     }
   }
 }
@@ -196,31 +172,18 @@ function compileNetworkPolicy(
   networkBase: string,
   changes: Record<string, unknown>,
 ): void {
-  if (network.egress !== undefined) {
-    changes[`${networkBase}.egress`] = network.egress;
-  }
-  if (network.allowedDomains !== undefined) {
-    changes[`${networkBase}.allowedDomains`] = network.allowedDomains;
-  }
-  if (network.deniedDomains !== undefined) {
-    changes[`${networkBase}.deniedDomains`] = network.deniedDomains;
-  }
-  if (network.dnsRebindingCheck !== undefined) {
-    changes[`${networkBase}.dnsRebindingCheck`] = network.dnsRebindingCheck;
-  }
-  if (network.denyPrivateRanges !== undefined) {
-    changes[`${networkBase}.denyPrivateRanges`] = network.denyPrivateRanges;
-  }
+  if (network.egress !== undefined) changes[`${networkBase}.egress`] = network.egress;
+  if (network.allowedDomains !== undefined) changes[`${networkBase}.allowedDomains`] = network.allowedDomains;
+  if (network.deniedDomains !== undefined) changes[`${networkBase}.deniedDomains`] = network.deniedDomains;
+  if (network.dnsRebindingCheck !== undefined) changes[`${networkBase}.dnsRebindingCheck`] = network.dnsRebindingCheck;
+  if (network.denyPrivateRanges !== undefined) changes[`${networkBase}.denyPrivateRanges`] = network.denyPrivateRanges;
 }
 
 function compileSecrets(
   secrets: SecretsDeclaration,
   changes: Record<string, unknown>,
-  unsupported: string[],
   warnings: string[],
-  strict: boolean,
 ): void {
-  // Convert consumer mappings to OpenClaw SecretRef format
   const mapping: Record<string, unknown> = {};
   for (const consumer of secrets.consumer) {
     const source = secrets.mapping[consumer.name];
@@ -247,9 +210,7 @@ function compileSecrets(
   changes["secrets.mapping"] = mapping;
 
   if (secrets.audit) {
-    if (secrets.audit.logAccess !== undefined) {
-      changes["secrets.audit.logAccess"] = secrets.audit.logAccess;
-    }
+    if (secrets.audit.logAccess !== undefined) changes["secrets.audit.logAccess"] = secrets.audit.logAccess;
     if (secrets.audit.redactInTranscripts !== undefined) {
       changes["secrets.audit.redactInTranscripts"] = secrets.audit.redactInTranscripts;
     }
@@ -263,7 +224,6 @@ function compileChannels(
   warnings: string[],
   strict: boolean,
 ): void {
-  // Convert channel bindings to OpenClaw bindings format
   const bindings: unknown[] = [];
   for (const binding of channels.bindings) {
     if (binding.channel === "discord") {
@@ -287,11 +247,8 @@ function compileChannels(
         },
       });
     } else {
-      if (strict) {
-        unsupported.push(`channels.bindings.${binding.channel}`);
-      } else {
-        warnings.push(`channels.bindings.${binding.channel}: channel type not yet supported`);
-      }
+      if (strict) unsupported.push(`channels.bindings.${binding.channel}`);
+      else warnings.push(`channels.bindings.${binding.channel}: channel type not yet supported`);
     }
   }
   if (bindings.length > 0) {
@@ -302,9 +259,6 @@ function compileChannels(
 function compileSchedules(
   schedules: ScheduleDeclaration[],
   changes: Record<string, unknown>,
-  unsupported: string[],
-  warnings: string[],
-  strict: boolean,
 ): void {
   const jobs: unknown[] = [];
   for (const schedule of schedules) {
@@ -320,26 +274,19 @@ function compileSchedules(
 }
 
 /**
- * Round-trip validation: compile → decompile → compare.
- * Returns true if the round-trip is lossless.
+ * Compile coverage validation.
  */
-export function validateRoundTrip(manifest: AgentPackageManifest): {
+export function validateCompileCoverage(manifest: AgentPackageManifest): {
   lossless: boolean;
   diff: ConfigDiff;
   missing: string[];
 } {
   const diff = compileManifest(manifest, { strict: false });
-
-  // Check which manifest fields didn't produce any config changes
-  const missing: string[] = [];
-
-  if (manifest.policy?.onUpgrade && !diff.unsupported.includes("policy.onUpgrade")) {
-    missing.push("policy.onUpgrade");
-  }
-
   return {
-    lossless: missing.length === 0 && diff.unsupported.length === 0,
+    lossless: diff.unsupported.length === 0,
     diff,
-    missing,
+    missing: diff.unsupported,
   };
 }
+
+export const validateRoundTrip = validateCompileCoverage;
