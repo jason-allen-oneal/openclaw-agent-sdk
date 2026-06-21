@@ -188,8 +188,6 @@ export const DEFAULT_DENY_PRIVATE_RANGES = [
   "::1/128",
 ] as const;
 
-// ── Hash utilities ──────────────────────────────────────────────────
-
 // ── Policy enforcement ──────────────────────────────────────────────
 
 export { resolveSecret, isToolAllowed } from "./policy/secrets.js";
@@ -206,7 +204,7 @@ export type { EgressCheckResult } from "./policy/network.js";
 
 // ── Config compiler ──────────────────────────────────────────────────
 
-export { compileManifest, validateRoundTrip } from "./compiler/compiler.js";
+export { compileManifest, validateRoundTrip, validateCompileCoverage } from "./compiler/compiler.js";
 export type { ConfigDiff, CompilerOptions } from "./compiler/compiler.js";
 
 // ── Mutation detection + quarantine ─────────────────────────────────
