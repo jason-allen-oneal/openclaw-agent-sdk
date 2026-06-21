@@ -75,5 +75,6 @@ export function normalizeManifestPath(value: string): string {
 export function isSameOrInsidePath(parent: string, child: string): boolean {
   const normalizedParent = normalizeManifestPath(parent);
   const normalizedChild = normalizeManifestPath(child);
+  if (normalizedParent === ".") return true;
   return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
 }
