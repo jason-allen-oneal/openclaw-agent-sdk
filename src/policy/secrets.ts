@@ -1,8 +1,8 @@
 // @openclaw/agent-sdk — Secret reference resolution (fail-closed).
 
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import type { SecretMapping } from "../index.js";
+import { resolveWorkspacePath } from "../paths.js";
 
 export interface SecretResolution {
   value: string | undefined;
@@ -34,12 +34,12 @@ function parseSource(mapping: SecretMapping): SecretSource {
 
 /**
  * Resolve a secret from its declared source.
- * Fail-closed: returns undefined + error message on any failure.
+ * Fail closed: returns undefined plus an error message on any failure.
  * Never throws.
  */
 export function resolveSecret(
   mapping: SecretMapping,
-  workspacePath: string = "",
+  workspacePath: string = ".",
 ): SecretResolution {
   try {
     const source = parseSource(mapping);
@@ -53,27 +53,24 @@ export function resolveSecret(
     }
 
     if (source.type === "gateway") {
-      // Gateway secret resolution requires the gateway runtime.
-      // In standalone/test mode, this always fails closed.
       return {
         value: undefined,
         error: `gateway secret resolution not available in this context: ${source.ref}`,
       };
     }
 
-    if (source.type === "file") {
-      const filePath = resolve(workspacePath, source.path);
-      if (!existsSync(filePath)) {
-        return { value: undefined, error: `secret file not found: ${source.path}` };
-      }
-      const value = readFileSync(filePath, "utf8").trim();
-      if (!value) {
-        return { value: undefined, error: `secret file is empty: ${source.path}` };
-      }
-      return { value };
+    const resolved = resolveWorkspacePath(workspacePath, source.path, "secret file path");
+    if (resolved.error || !resolved.path) {
+      return { value: undefined, error: resolved.error ?? `invalid secret file path: ${source.path}` };
     }
-
-    return { value: undefined, error: `unknown secret source type` };
+    if (!existsSync(resolved.path)) {
+      return { value: undefined, error: `secret file not found: ${source.path}` };
+    }
+    const value = readFileSync(resolved.path, "utf8").trim();
+    if (!value) {
+      return { value: undefined, error: `secret file is empty: ${source.path}` };
+    }
+    return { value };
   } catch (e) {
     return { value: undefined, error: `secret resolution error: ${(e as Error).message}` };
   }
@@ -87,9 +84,7 @@ export function isToolAllowed(
   allowList: string[] | undefined,
   globalDeny: string[] | undefined,
 ): boolean {
-  // If global deny list exists and includes this tool, block.
   if (globalDeny?.includes(toolName)) return false;
-  // If allow list exists and doesn't include this tool, block.
   if (allowList !== undefined && !allowList.includes(toolName)) return false;
   return true;
 }
