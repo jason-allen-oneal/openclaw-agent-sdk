@@ -1,15 +1,15 @@
 // @openclaw/agent-sdk — Pack command: validate manifest, hash files, generate integrity manifest.
 
-import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { Command } from "commander";
 import { hashFile } from "../hash.js";
 import type {
   AgentPackageManifest,
   IntegrityManifest,
-  FileCopyEntry,
   SkillDeclaration,
 } from "../index.js";
+import { resolvePackageFile, resolveWorkspacePath } from "../paths.js";
 
 function loadManifest(packagePath: string): AgentPackageManifest {
   const manifestPath = resolve(packagePath, "agent-package.json");
@@ -20,7 +20,7 @@ function loadManifest(packagePath: string): AgentPackageManifest {
   return JSON.parse(raw) as AgentPackageManifest;
 }
 
-function validateRequiredFields(manifest: AgentPackageManifest): string[] {
+function validateRequiredFields(manifest: Partial<AgentPackageManifest>): string[] {
   const errors: string[] = [];
   if (!manifest.name) errors.push("name is required");
   if (!manifest.version) errors.push("version is required");
@@ -28,37 +28,10 @@ function validateRequiredFields(manifest: AgentPackageManifest): string[] {
   if (!manifest.files) {
     errors.push("files is required");
   } else {
-    if (!manifest.files.copy) errors.push("files.copy is required");
-    if (!manifest.files.mutable) errors.push("files.mutable is required");
+    if (!Array.isArray(manifest.files.copy)) errors.push("files.copy must be an array");
+    if (!Array.isArray(manifest.files.mutable)) errors.push("files.mutable must be an array");
   }
   return errors;
-}
-
-function isInsideRoot(root: string, target: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-function resolvePackageFile(packagePath: string, src: string): { path?: string; error?: string } {
-  if (!src || isAbsolute(src)) return { error: `absolute source paths are not allowed: ${src}` };
-  const resolved = resolve(packagePath, src);
-  if (!isInsideRoot(packagePath, resolved)) return { error: `source escapes package root: ${src}` };
-  if (!existsSync(resolved)) return { error: `src not found: ${src} (resolved: ${resolved})` };
-  if (!lstatSync(resolved).isFile()) return { error: `source must be a regular file: ${src}` };
-  const real = realpathSync(resolved);
-  if (!isInsideRoot(packagePath, real)) {
-    return { error: `source resolves outside package root: ${src}` };
-  }
-  return { path: real };
-}
-
-function validateWorkspaceRelativeDest(dest: string): string | null {
-  if (!dest || isAbsolute(dest)) return `absolute destination paths are not allowed: ${dest}`;
-  const normalized = relative(".", dest);
-  if (normalized.startsWith("..") || isAbsolute(normalized)) {
-    return `destination escapes workspace root: ${dest}`;
-  }
-  return null;
 }
 
 function validateCopyEntries(
@@ -68,15 +41,15 @@ function validateCopyEntries(
   const resolved = new Map<string, string>();
   const errors: string[] = [];
 
-  for (const entry of manifest.files.copy) {
-    const source = resolvePackageFile(packagePath, entry.src);
+  for (const [index, entry] of manifest.files.copy.entries()) {
+    const source = resolvePackageFile(packagePath, entry.src, `files.copy.${index}.src`);
     if (source.error || !source.path) {
-      errors.push(`files.copy: ${source.error}`);
+      errors.push(source.error ?? `files.copy.${index}.src could not be resolved`);
       continue;
     }
-    const destError = validateWorkspaceRelativeDest(entry.dest);
-    if (destError) {
-      errors.push(`files.copy: ${destError}`);
+    const dest = resolveWorkspacePath(packagePath, entry.dest, `files.copy.${index}.dest`);
+    if (dest.error) {
+      errors.push(dest.error);
       continue;
     }
     const hash = hashFile(source.path);
@@ -97,16 +70,15 @@ function hashSkillFiles(
 
   for (const skill of skills) {
     const skillSource = `${skill.path}/SKILL.md`;
-    const skillMd = resolvePackageFile(packagePath, skillSource);
+    const skillMd = resolvePackageFile(packagePath, skillSource, `skills.${skill.path}.SKILL.md`);
     if (skillMd.error || !skillMd.path) {
       if (skill.required !== false) {
-        errors.push(`skills: required SKILL.md invalid: ${skillSource}: ${skillMd.error}`);
+        errors.push(`required SKILL.md invalid: ${skillSource}: ${skillMd.error}`);
       }
       continue;
     }
-    const relPath = skillSource;
     const hash = hashFile(skillMd.path);
-    resolved.set(relPath, hash);
+    resolved.set(skillSource, hash);
   }
 
   return { resolved, errors };
@@ -134,10 +106,7 @@ export const packCommand = new Command("pack")
     }
 
     const { resolved: fileHashes, errors: fileErrors } = validateCopyEntries(manifest, resolved);
-    const { resolved: skillHashes, errors: skillErrors } = hashSkillFiles(
-      manifest.skills,
-      resolved,
-    );
+    const { resolved: skillHashes, errors: skillErrors } = hashSkillFiles(manifest.skills, resolved);
 
     const allErrors = [...fileErrors, ...skillErrors];
     if (allErrors.length > 0) {
