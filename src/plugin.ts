@@ -1,9 +1,25 @@
-import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk/plugin-entry";
+type OpenClawPluginDefinition = {
+  id: string;
+  name: string;
+  description: string;
+  register(api: {
+    pluginConfig?: unknown;
+    registerCli: (
+      setup: (context: { program: { addCommand(command: unknown): void } }) => Promise<void>,
+      metadata: { descriptors: Array<{ name: string; description: string; hasSubcommands: boolean }> },
+    ) => void;
+    registerTrustedToolPolicy: (policy: {
+      id: string;
+      description: string;
+      evaluate: (event: { toolName: string; params: unknown }) => { block: boolean; blockReason: string } | undefined;
+    }) => void;
+  }): void;
+};
 
 export * from "./index.js";
 export { resolveSecret, isToolAllowed } from "./policy/secrets.js";
 export { checkNetworkEgress, isPrivateIp, checkDnsRebinding } from "./policy/network.js";
-export { compileManifest, validateRoundTrip } from "./compiler/compiler.js";
+export { compileManifest, validateRoundTrip, validateCompileCoverage } from "./compiler/compiler.js";
 export {
   checkMutation,
   quarantinePackage,
@@ -76,7 +92,7 @@ const entry: OpenClawPluginDefinition = {
           }
         }
 
-        return;
+        return undefined;
       },
     });
   },
